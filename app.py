@@ -1,4 +1,3 @@
-print(dir(Flask))
 from flask import Flask, jsonify, request
 from datetime import datetime
 from flask_cors import CORS  # Import the CORS module
