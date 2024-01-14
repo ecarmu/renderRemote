@@ -1,458 +1,964 @@
-from flask import Flask, jsonify, request
-from datetime import datetime
-from flask_cors import CORS  # Import the CORS module
-from werkzeug.security import generate_password_hash, check_password_hash
-import sqlite3
+from __future__ import annotations
 
-print(dir(Flask))
+import logging
+import os
+import sys
+import typing as t
+from datetime import timedelta
+from itertools import chain
 
-app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
-print(app)
+from werkzeug.exceptions import Aborter
+from werkzeug.exceptions import BadRequest
+from werkzeug.exceptions import BadRequestKeyError
+from werkzeug.routing import BuildError
+from werkzeug.routing import Map
+from werkzeug.routing import Rule
+from werkzeug.sansio.response import Response
+from werkzeug.utils import cached_property
+from werkzeug.utils import redirect as _wz_redirect
 
-def createHotelsTable():
-    # Connect to the database (this will create a new file if it doesn't exist)
-    conn = sqlite3.connect('hotels.db')
+from .. import typing as ft
+from ..config import Config
+from ..config import ConfigAttribute
+from ..ctx import _AppCtxGlobals
+from ..helpers import _split_blueprint_path
+from ..helpers import get_debug_flag
+from ..json.provider import DefaultJSONProvider
+from ..json.provider import JSONProvider
+from ..logging import create_logger
+from ..templating import DispatchingJinjaLoader
+from ..templating import Environment
+from .scaffold import _endpoint_from_view_func
+from .scaffold import find_package
+from .scaffold import Scaffold
+from .scaffold import setupmethod
 
-    # Create a cursor object to execute SQL statements
-    cursor = conn.cursor()
+if t.TYPE_CHECKING:  # pragma: no cover
+    from werkzeug.wrappers import Response as BaseResponse
+    from .blueprints import Blueprint
+    from ..testing import FlaskClient
+    from ..testing import FlaskCliRunner
 
-    # Create a table for hotels
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS hotels (
-            id INTEGER PRIMARY KEY,
-            imageLink TEXT,
-            rating REAL,
-            hotelName TEXT,
-            hotelDesc TEXT,
-            location TEXT,
-            country TEXT,
-            price INTEGER,
-            stayDetails TEXT,
-            locationLink TEXT,
-            locationInfo TEXT,
-            allAmenities TEXT,  -- Assuming you want to store amenities as a JSON or comma-separated list
-            commentAmount INTEGER,
-            availableFrom DATE,
-            availableTo DATE,
-            isCheapToMembers BOOLEAN, 
-            availableRoomAmount int
+T_shell_context_processor = t.TypeVar(
+    "T_shell_context_processor", bound=ft.ShellContextProcessorCallable
+)
+T_teardown = t.TypeVar("T_teardown", bound=ft.TeardownCallable)
+T_template_filter = t.TypeVar("T_template_filter", bound=ft.TemplateFilterCallable)
+T_template_global = t.TypeVar("T_template_global", bound=ft.TemplateGlobalCallable)
+T_template_test = t.TypeVar("T_template_test", bound=ft.TemplateTestCallable)
+
+
+def _make_timedelta(value: timedelta | int | None) -> timedelta | None:
+    if value is None or isinstance(value, timedelta):
+        return value
+
+    return timedelta(seconds=value)
+
+
+class App(Scaffold):
+    """The flask object implements a WSGI application and acts as the central
+    object.  It is passed the name of the module or package of the
+    application.  Once it is created it will act as a central registry for
+    the view functions, the URL rules, template configuration and much more.
+
+    The name of the package is used to resolve resources from inside the
+    package or the folder the module is contained in depending on if the
+    package parameter resolves to an actual python package (a folder with
+    an :file:`__init__.py` file inside) or a standard module (just a ``.py`` file).
+
+    For more information about resource loading, see :func:`open_resource`.
+
+    Usually you create a :class:`Flask` instance in your main module or
+    in the :file:`__init__.py` file of your package like this::
+
+        from flask import Flask
+        app = Flask(__name__)
+
+    .. admonition:: About the First Parameter
+
+        The idea of the first parameter is to give Flask an idea of what
+        belongs to your application.  This name is used to find resources
+        on the filesystem, can be used by extensions to improve debugging
+        information and a lot more.
+
+        So it's important what you provide there.  If you are using a single
+        module, `__name__` is always the correct value.  If you however are
+        using a package, it's usually recommended to hardcode the name of
+        your package there.
+
+        For example if your application is defined in :file:`yourapplication/app.py`
+        you should create it with one of the two versions below::
+
+            app = Flask('yourapplication')
+            app = Flask(__name__.split('.')[0])
+
+        Why is that?  The application will work even with `__name__`, thanks
+        to how resources are looked up.  However it will make debugging more
+        painful.  Certain extensions can make assumptions based on the
+        import name of your application.  For example the Flask-SQLAlchemy
+        extension will look for the code in your application that triggered
+        an SQL query in debug mode.  If the import name is not properly set
+        up, that debugging information is lost.  (For example it would only
+        pick up SQL queries in `yourapplication.app` and not
+        `yourapplication.views.frontend`)
+
+    .. versionadded:: 0.7
+       The `static_url_path`, `static_folder`, and `template_folder`
+       parameters were added.
+
+    .. versionadded:: 0.8
+       The `instance_path` and `instance_relative_config` parameters were
+       added.
+
+    .. versionadded:: 0.11
+       The `root_path` parameter was added.
+
+    .. versionadded:: 1.0
+       The ``host_matching`` and ``static_host`` parameters were added.
+
+    .. versionadded:: 1.0
+       The ``subdomain_matching`` parameter was added. Subdomain
+       matching needs to be enabled manually now. Setting
+       :data:`SERVER_NAME` does not implicitly enable it.
+
+    :param import_name: the name of the application package
+    :param static_url_path: can be used to specify a different path for the
+                            static files on the web.  Defaults to the name
+                            of the `static_folder` folder.
+    :param static_folder: The folder with static files that is served at
+        ``static_url_path``. Relative to the application ``root_path``
+        or an absolute path. Defaults to ``'static'``.
+    :param static_host: the host to use when adding the static route.
+        Defaults to None. Required when using ``host_matching=True``
+        with a ``static_folder`` configured.
+    :param host_matching: set ``url_map.host_matching`` attribute.
+        Defaults to False.
+    :param subdomain_matching: consider the subdomain relative to
+        :data:`SERVER_NAME` when matching routes. Defaults to False.
+    :param template_folder: the folder that contains the templates that should
+                            be used by the application.  Defaults to
+                            ``'templates'`` folder in the root path of the
+                            application.
+    :param instance_path: An alternative instance path for the application.
+                          By default the folder ``'instance'`` next to the
+                          package or module is assumed to be the instance
+                          path.
+    :param instance_relative_config: if set to ``True`` relative filenames
+                                     for loading the config are assumed to
+                                     be relative to the instance path instead
+                                     of the application root.
+    :param root_path: The path to the root of the application files.
+        This should only be set manually when it can't be detected
+        automatically, such as for namespace packages.
+    """
+
+    #: The class of the object assigned to :attr:`aborter`, created by
+    #: :meth:`create_aborter`. That object is called by
+    #: :func:`flask.abort` to raise HTTP errors, and can be
+    #: called directly as well.
+    #:
+    #: Defaults to :class:`werkzeug.exceptions.Aborter`.
+    #:
+    #: .. versionadded:: 2.2
+    aborter_class = Aborter
+
+    #: The class that is used for the Jinja environment.
+    #:
+    #: .. versionadded:: 0.11
+    jinja_environment = Environment
+
+    #: The class that is used for the :data:`~flask.g` instance.
+    #:
+    #: Example use cases for a custom class:
+    #:
+    #: 1. Store arbitrary attributes on flask.g.
+    #: 2. Add a property for lazy per-request database connectors.
+    #: 3. Return None instead of AttributeError on unexpected attributes.
+    #: 4. Raise exception if an unexpected attr is set, a "controlled" flask.g.
+    #:
+    #: In Flask 0.9 this property was called `request_globals_class` but it
+    #: was changed in 0.10 to :attr:`app_ctx_globals_class` because the
+    #: flask.g object is now application context scoped.
+    #:
+    #: .. versionadded:: 0.10
+    app_ctx_globals_class = _AppCtxGlobals
+
+    #: The class that is used for the ``config`` attribute of this app.
+    #: Defaults to :class:`~flask.Config`.
+    #:
+    #: Example use cases for a custom class:
+    #:
+    #: 1. Default values for certain config options.
+    #: 2. Access to config values through attributes in addition to keys.
+    #:
+    #: .. versionadded:: 0.11
+    config_class = Config
+
+    #: The testing flag.  Set this to ``True`` to enable the test mode of
+    #: Flask extensions (and in the future probably also Flask itself).
+    #: For example this might activate test helpers that have an
+    #: additional runtime cost which should not be enabled by default.
+    #:
+    #: If this is enabled and PROPAGATE_EXCEPTIONS is not changed from the
+    #: default it's implicitly enabled.
+    #:
+    #: This attribute can also be configured from the config with the
+    #: ``TESTING`` configuration key.  Defaults to ``False``.
+    testing = ConfigAttribute("TESTING")
+
+    #: If a secret key is set, cryptographic components can use this to
+    #: sign cookies and other things. Set this to a complex random value
+    #: when you want to use the secure cookie for instance.
+    #:
+    #: This attribute can also be configured from the config with the
+    #: :data:`SECRET_KEY` configuration key. Defaults to ``None``.
+    secret_key = ConfigAttribute("SECRET_KEY")
+
+    #: A :class:`~datetime.timedelta` which is used to set the expiration
+    #: date of a permanent session.  The default is 31 days which makes a
+    #: permanent session survive for roughly one month.
+    #:
+    #: This attribute can also be configured from the config with the
+    #: ``PERMANENT_SESSION_LIFETIME`` configuration key.  Defaults to
+    #: ``timedelta(days=31)``
+    permanent_session_lifetime = ConfigAttribute(
+        "PERMANENT_SESSION_LIFETIME", get_converter=_make_timedelta
+    )
+
+    json_provider_class: type[JSONProvider] = DefaultJSONProvider
+    """A subclass of :class:`~flask.json.provider.JSONProvider`. An
+    instance is created and assigned to :attr:`app.json` when creating
+    the app.
+
+    The default, :class:`~flask.json.provider.DefaultJSONProvider`, uses
+    Python's built-in :mod:`json` library. A different provider can use
+    a different JSON library.
+
+    .. versionadded:: 2.2
+    """
+
+    #: Options that are passed to the Jinja environment in
+    #: :meth:`create_jinja_environment`. Changing these options after
+    #: the environment is created (accessing :attr:`jinja_env`) will
+    #: have no effect.
+    #:
+    #: .. versionchanged:: 1.1.0
+    #:     This is a ``dict`` instead of an ``ImmutableDict`` to allow
+    #:     easier configuration.
+    #:
+    jinja_options: dict = {}
+
+    #: The rule object to use for URL rules created.  This is used by
+    #: :meth:`add_url_rule`.  Defaults to :class:`werkzeug.routing.Rule`.
+    #:
+    #: .. versionadded:: 0.7
+    url_rule_class = Rule
+
+    #: The map object to use for storing the URL rules and routing
+    #: configuration parameters. Defaults to :class:`werkzeug.routing.Map`.
+    #:
+    #: .. versionadded:: 1.1.0
+    url_map_class = Map
+
+    #: The :meth:`test_client` method creates an instance of this test
+    #: client class. Defaults to :class:`~flask.testing.FlaskClient`.
+    #:
+    #: .. versionadded:: 0.7
+    test_client_class: type[FlaskClient] | None = None
+
+    #: The :class:`~click.testing.CliRunner` subclass, by default
+    #: :class:`~flask.testing.FlaskCliRunner` that is used by
+    #: :meth:`test_cli_runner`. Its ``__init__`` method should take a
+    #: Flask app object as the first argument.
+    #:
+    #: .. versionadded:: 1.0
+    test_cli_runner_class: type[FlaskCliRunner] | None = None
+
+    default_config: dict
+    response_class: type[Response]
+
+    def __init__(
+        self,
+        import_name: str,
+        static_url_path: str | None = None,
+        static_folder: str | os.PathLike | None = "static",
+        static_host: str | None = None,
+        host_matching: bool = False,
+        subdomain_matching: bool = False,
+        template_folder: str | os.PathLike | None = "templates",
+        instance_path: str | None = None,
+        instance_relative_config: bool = False,
+        root_path: str | None = None,
+    ):
+        super().__init__(
+            import_name=import_name,
+            static_folder=static_folder,
+            static_url_path=static_url_path,
+            template_folder=template_folder,
+            root_path=root_path,
         )
-    ''')
 
-    # Insert a sample record
-    cursor.execute('''
-        INSERT INTO hotels (
-            id, imageLink, rating, hotelName, hotelDesc, location, country, price, stayDetails,
-            locationLink, locationInfo, allAmenities, commentAmount, availableFrom, availableTo, isCheapToMembers, availableRoomAmount
-        ) VALUES (
-            1, 'https://images.trvl-media.com/lodging/2000000/1210000/1207100/1207007/62555c3d_w.jpg?impolicy=fcrop&w=600&h=400&p=1&q=high',
-            9.6, 'Lara Barut Collection - Ultra All Inclusive', 'Lara Plajı yakınında, kongre merkezi bağlantılı, tam donanımlı spa olan her şey dâhil resort otel', 'Antalya', 'Turkey',
-            7739,
-            '2 gecelik için', 
-            'https://www.google.com/maps/embed?pb=!1m18!1m12!1m3!1d25538.871677594318!2d30.83790233519331!3d36.85782586928015!2m3!1f0!2f0!3f0!3m2!1i1024!2i768!4f13.1!3m3!1m2!1s0x14c359420fff7e37%3A0x3bf6a3a890bbd8f2!2sLara%20Barut%20Collection!5e0!3m2!1str!2str!4v1704991199346!5m2!1str!2str',
-            'Güzeloba Mah. Yaşar Sobutay Mah. No.: 30, Lara, Antalya, Antalya, 07235',
-            '["Restoran", "Bar", "Havuz", "Spa", "Spor Salonu", "Ücretsiz kablosuz internet"]',
-            650,
-            '2024-01-18',
-            '2024-01-23',
-            'true', 2
+        if instance_path is None:
+            instance_path = self.auto_find_instance_path()
+        elif not os.path.isabs(instance_path):
+            raise ValueError(
+                "If an instance path is provided it must be absolute."
+                " A relative path was given instead."
+            )
+
+        #: Holds the path to the instance folder.
+        #:
+        #: .. versionadded:: 0.8
+        self.instance_path = instance_path
+
+        #: The configuration dictionary as :class:`Config`.  This behaves
+        #: exactly like a regular dictionary but supports additional methods
+        #: to load a config from files.
+        self.config = self.make_config(instance_relative_config)
+
+        #: An instance of :attr:`aborter_class` created by
+        #: :meth:`make_aborter`. This is called by :func:`flask.abort`
+        #: to raise HTTP errors, and can be called directly as well.
+        #:
+        #: .. versionadded:: 2.2
+        #:     Moved from ``flask.abort``, which calls this object.
+        self.aborter = self.make_aborter()
+
+        self.json: JSONProvider = self.json_provider_class(self)
+        """Provides access to JSON methods. Functions in ``flask.json``
+        will call methods on this provider when the application context
+        is active. Used for handling JSON requests and responses.
+
+        An instance of :attr:`json_provider_class`. Can be customized by
+        changing that attribute on a subclass, or by assigning to this
+        attribute afterwards.
+
+        The default, :class:`~flask.json.provider.DefaultJSONProvider`,
+        uses Python's built-in :mod:`json` library. A different provider
+        can use a different JSON library.
+
+        .. versionadded:: 2.2
+        """
+
+        #: A list of functions that are called by
+        #: :meth:`handle_url_build_error` when :meth:`.url_for` raises a
+        #: :exc:`~werkzeug.routing.BuildError`. Each function is called
+        #: with ``error``, ``endpoint`` and ``values``. If a function
+        #: returns ``None`` or raises a ``BuildError``, it is skipped.
+        #: Otherwise, its return value is returned by ``url_for``.
+        #:
+        #: .. versionadded:: 0.9
+        self.url_build_error_handlers: list[
+            t.Callable[[Exception, str, dict[str, t.Any]], str]
+        ] = []
+
+        #: A list of functions that are called when the application context
+        #: is destroyed.  Since the application context is also torn down
+        #: if the request ends this is the place to store code that disconnects
+        #: from databases.
+        #:
+        #: .. versionadded:: 0.9
+        self.teardown_appcontext_funcs: list[ft.TeardownCallable] = []
+
+        #: A list of shell context processor functions that should be run
+        #: when a shell context is created.
+        #:
+        #: .. versionadded:: 0.11
+        self.shell_context_processors: list[ft.ShellContextProcessorCallable] = []
+
+        #: Maps registered blueprint names to blueprint objects. The
+        #: dict retains the order the blueprints were registered in.
+        #: Blueprints can be registered multiple times, this dict does
+        #: not track how often they were attached.
+        #:
+        #: .. versionadded:: 0.7
+        self.blueprints: dict[str, Blueprint] = {}
+
+        #: a place where extensions can store application specific state.  For
+        #: example this is where an extension could store database engines and
+        #: similar things.
+        #:
+        #: The key must match the name of the extension module. For example in
+        #: case of a "Flask-Foo" extension in `flask_foo`, the key would be
+        #: ``'foo'``.
+        #:
+        #: .. versionadded:: 0.7
+        self.extensions: dict = {}
+
+        #: The :class:`~werkzeug.routing.Map` for this instance.  You can use
+        #: this to change the routing converters after the class was created
+        #: but before any routes are connected.  Example::
+        #:
+        #:    from werkzeug.routing import BaseConverter
+        #:
+        #:    class ListConverter(BaseConverter):
+        #:        def to_python(self, value):
+        #:            return value.split(',')
+        #:        def to_url(self, values):
+        #:            return ','.join(super(ListConverter, self).to_url(value)
+        #:                            for value in values)
+        #:
+        #:    app = Flask(__name__)
+        #:    app.url_map.converters['list'] = ListConverter
+        self.url_map = self.url_map_class(host_matching=host_matching)
+
+        self.subdomain_matching = subdomain_matching
+
+        # tracks internally if the application already handled at least one
+        # request.
+        self._got_first_request = False
+
+        # Set the name of the Click group in case someone wants to add
+        # the app's commands to another CLI tool.
+        self.cli.name = self.name
+
+    def _check_setup_finished(self, f_name: str) -> None:
+        if self._got_first_request:
+            raise AssertionError(
+                f"The setup method '{f_name}' can no longer be called"
+                " on the application. It has already handled its first"
+                " request, any changes will not be applied"
+                " consistently.\n"
+                "Make sure all imports, decorators, functions, etc."
+                " needed to set up the application are done before"
+                " running it."
+            )
+
+    @cached_property
+    def name(self) -> str:  # type: ignore
+        """The name of the application.  This is usually the import name
+        with the difference that it's guessed from the run file if the
+        import name is main.  This name is used as a display name when
+        Flask needs the name of the application.  It can be set and overridden
+        to change the value.
+
+        .. versionadded:: 0.8
+        """
+        if self.import_name == "__main__":
+            fn = getattr(sys.modules["__main__"], "__file__", None)
+            if fn is None:
+                return "__main__"
+            return os.path.splitext(os.path.basename(fn))[0]
+        return self.import_name
+
+    @cached_property
+    def logger(self) -> logging.Logger:
+        """A standard Python :class:`~logging.Logger` for the app, with
+        the same name as :attr:`name`.
+
+        In debug mode, the logger's :attr:`~logging.Logger.level` will
+        be set to :data:`~logging.DEBUG`.
+
+        If there are no handlers configured, a default handler will be
+        added. See :doc:`/logging` for more information.
+
+        .. versionchanged:: 1.1.0
+            The logger takes the same name as :attr:`name` rather than
+            hard-coding ``"flask.app"``.
+
+        .. versionchanged:: 1.0.0
+            Behavior was simplified. The logger is always named
+            ``"flask.app"``. The level is only set during configuration,
+            it doesn't check ``app.debug`` each time. Only one format is
+            used, not different ones depending on ``app.debug``. No
+            handlers are removed, and a handler is only added if no
+            handlers are already configured.
+
+        .. versionadded:: 0.3
+        """
+        return create_logger(self)
+
+    @cached_property
+    def jinja_env(self) -> Environment:
+        """The Jinja environment used to load templates.
+
+        The environment is created the first time this property is
+        accessed. Changing :attr:`jinja_options` after that will have no
+        effect.
+        """
+        return self.create_jinja_environment()
+
+    def create_jinja_environment(self) -> Environment:
+        raise NotImplementedError()
+
+    def make_config(self, instance_relative: bool = False) -> Config:
+        """Used to create the config attribute by the Flask constructor.
+        The `instance_relative` parameter is passed in from the constructor
+        of Flask (there named `instance_relative_config`) and indicates if
+        the config should be relative to the instance path or the root path
+        of the application.
+
+        .. versionadded:: 0.8
+        """
+        root_path = self.root_path
+        if instance_relative:
+            root_path = self.instance_path
+        defaults = dict(self.default_config)
+        defaults["DEBUG"] = get_debug_flag()
+        return self.config_class(root_path, defaults)
+
+    def make_aborter(self) -> Aborter:
+        """Create the object to assign to :attr:`aborter`. That object
+        is called by :func:`flask.abort` to raise HTTP errors, and can
+        be called directly as well.
+
+        By default, this creates an instance of :attr:`aborter_class`,
+        which defaults to :class:`werkzeug.exceptions.Aborter`.
+
+        .. versionadded:: 2.2
+        """
+        return self.aborter_class()
+
+    def auto_find_instance_path(self) -> str:
+        """Tries to locate the instance path if it was not provided to the
+        constructor of the application class.  It will basically calculate
+        the path to a folder named ``instance`` next to your main file or
+        the package.
+
+        .. versionadded:: 0.8
+        """
+        prefix, package_path = find_package(self.import_name)
+        if prefix is None:
+            return os.path.join(package_path, "instance")
+        return os.path.join(prefix, "var", f"{self.name}-instance")
+
+    def create_global_jinja_loader(self) -> DispatchingJinjaLoader:
+        """Creates the loader for the Jinja2 environment.  Can be used to
+        override just the loader and keeping the rest unchanged.  It's
+        discouraged to override this function.  Instead one should override
+        the :meth:`jinja_loader` function instead.
+
+        The global loader dispatches between the loaders of the application
+        and the individual blueprints.
+
+        .. versionadded:: 0.7
+        """
+        return DispatchingJinjaLoader(self)
+
+    def select_jinja_autoescape(self, filename: str) -> bool:
+        """Returns ``True`` if autoescaping should be active for the given
+        template name. If no template name is given, returns `True`.
+
+        .. versionchanged:: 2.2
+            Autoescaping is now enabled by default for ``.svg`` files.
+
+        .. versionadded:: 0.5
+        """
+        if filename is None:
+            return True
+        return filename.endswith((".html", ".htm", ".xml", ".xhtml", ".svg"))
+
+    @property
+    def debug(self) -> bool:
+        """Whether debug mode is enabled. When using ``flask run`` to start the
+        development server, an interactive debugger will be shown for unhandled
+        exceptions, and the server will be reloaded when code changes. This maps to the
+        :data:`DEBUG` config key. It may not behave as expected if set late.
+
+        **Do not enable debug mode when deploying in production.**
+
+        Default: ``False``
+        """
+        return self.config["DEBUG"]
+
+    @debug.setter
+    def debug(self, value: bool) -> None:
+        self.config["DEBUG"] = value
+
+        if self.config["TEMPLATES_AUTO_RELOAD"] is None:
+            self.jinja_env.auto_reload = value
+
+    @setupmethod
+    def register_blueprint(self, blueprint: Blueprint, **options: t.Any) -> None:
+        """Register a :class:`~flask.Blueprint` on the application. Keyword
+        arguments passed to this method will override the defaults set on the
+        blueprint.
+
+        Calls the blueprint's :meth:`~flask.Blueprint.register` method after
+        recording the blueprint in the application's :attr:`blueprints`.
+
+        :param blueprint: The blueprint to register.
+        :param url_prefix: Blueprint routes will be prefixed with this.
+        :param subdomain: Blueprint routes will match on this subdomain.
+        :param url_defaults: Blueprint routes will use these default values for
+            view arguments.
+        :param options: Additional keyword arguments are passed to
+            :class:`~flask.blueprints.BlueprintSetupState`. They can be
+            accessed in :meth:`~flask.Blueprint.record` callbacks.
+
+        .. versionchanged:: 2.0.1
+            The ``name`` option can be used to change the (pre-dotted)
+            name the blueprint is registered with. This allows the same
+            blueprint to be registered multiple times with unique names
+            for ``url_for``.
+
+        .. versionadded:: 0.7
+        """
+        blueprint.register(self, options)
+
+    def iter_blueprints(self) -> t.ValuesView[Blueprint]:
+        """Iterates over all blueprints by the order they were registered.
+
+        .. versionadded:: 0.11
+        """
+        return self.blueprints.values()
+
+    @setupmethod
+    def add_url_rule(
+        self,
+        rule: str,
+        endpoint: str | None = None,
+        view_func: ft.RouteCallable | None = None,
+        provide_automatic_options: bool | None = None,
+        **options: t.Any,
+    ) -> None:
+        if endpoint is None:
+            endpoint = _endpoint_from_view_func(view_func)  # type: ignore
+        options["endpoint"] = endpoint
+        methods = options.pop("methods", None)
+
+        # if the methods are not given and the view_func object knows its
+        # methods we can use that instead.  If neither exists, we go with
+        # a tuple of only ``GET`` as default.
+        if methods is None:
+            methods = getattr(view_func, "methods", None) or ("GET",)
+        if isinstance(methods, str):
+            raise TypeError(
+                "Allowed methods must be a list of strings, for"
+                ' example: @app.route(..., methods=["POST"])'
+            )
+        methods = {item.upper() for item in methods}
+
+        # Methods that should always be added
+        required_methods = set(getattr(view_func, "required_methods", ()))
+
+        # starting with Flask 0.8 the view_func object can disable and
+        # force-enable the automatic options handling.
+        if provide_automatic_options is None:
+            provide_automatic_options = getattr(
+                view_func, "provide_automatic_options", None
+            )
+
+        if provide_automatic_options is None:
+            if "OPTIONS" not in methods:
+                provide_automatic_options = True
+                required_methods.add("OPTIONS")
+            else:
+                provide_automatic_options = False
+
+        # Add the required methods now.
+        methods |= required_methods
+
+        rule = self.url_rule_class(rule, methods=methods, **options)
+        rule.provide_automatic_options = provide_automatic_options  # type: ignore
+
+        self.url_map.add(rule)
+        if view_func is not None:
+            old_func = self.view_functions.get(endpoint)
+            if old_func is not None and old_func != view_func:
+                raise AssertionError(
+                    "View function mapping is overwriting an existing"
+                    f" endpoint function: {endpoint}"
+                )
+            self.view_functions[endpoint] = view_func
+
+    @setupmethod
+    def template_filter(
+        self, name: str | None = None
+    ) -> t.Callable[[T_template_filter], T_template_filter]:
+        """A decorator that is used to register custom template filter.
+        You can specify a name for the filter, otherwise the function
+        name will be used. Example::
+
+          @app.template_filter()
+          def reverse(s):
+              return s[::-1]
+
+        :param name: the optional name of the filter, otherwise the
+                     function name will be used.
+        """
+
+        def decorator(f: T_template_filter) -> T_template_filter:
+            self.add_template_filter(f, name=name)
+            return f
+
+        return decorator
+
+    @setupmethod
+    def add_template_filter(
+        self, f: ft.TemplateFilterCallable, name: str | None = None
+    ) -> None:
+        """Register a custom template filter.  Works exactly like the
+        :meth:`template_filter` decorator.
+
+        :param name: the optional name of the filter, otherwise the
+                     function name will be used.
+        """
+        self.jinja_env.filters[name or f.__name__] = f
+
+    @setupmethod
+    def template_test(
+        self, name: str | None = None
+    ) -> t.Callable[[T_template_test], T_template_test]:
+        """A decorator that is used to register custom template test.
+        You can specify a name for the test, otherwise the function
+        name will be used. Example::
+
+          @app.template_test()
+          def is_prime(n):
+              if n == 2:
+                  return True
+              for i in range(2, int(math.ceil(math.sqrt(n))) + 1):
+                  if n % i == 0:
+                      return False
+              return True
+
+        .. versionadded:: 0.10
+
+        :param name: the optional name of the test, otherwise the
+                     function name will be used.
+        """
+
+        def decorator(f: T_template_test) -> T_template_test:
+            self.add_template_test(f, name=name)
+            return f
+
+        return decorator
+
+    @setupmethod
+    def add_template_test(
+        self, f: ft.TemplateTestCallable, name: str | None = None
+    ) -> None:
+        """Register a custom template test.  Works exactly like the
+        :meth:`template_test` decorator.
+
+        .. versionadded:: 0.10
+
+        :param name: the optional name of the test, otherwise the
+                     function name will be used.
+        """
+        self.jinja_env.tests[name or f.__name__] = f
+
+    @setupmethod
+    def template_global(
+        self, name: str | None = None
+    ) -> t.Callable[[T_template_global], T_template_global]:
+        """A decorator that is used to register a custom template global function.
+        You can specify a name for the global function, otherwise the function
+        name will be used. Example::
+
+            @app.template_global()
+            def double(n):
+                return 2 * n
+
+        .. versionadded:: 0.10
+
+        :param name: the optional name of the global function, otherwise the
+                     function name will be used.
+        """
+
+        def decorator(f: T_template_global) -> T_template_global:
+            self.add_template_global(f, name=name)
+            return f
+
+        return decorator
+
+    @setupmethod
+    def add_template_global(
+        self, f: ft.TemplateGlobalCallable, name: str | None = None
+    ) -> None:
+        """Register a custom template global function. Works exactly like the
+        :meth:`template_global` decorator.
+
+        .. versionadded:: 0.10
+
+        :param name: the optional name of the global function, otherwise the
+                     function name will be used.
+        """
+        self.jinja_env.globals[name or f.__name__] = f
+
+    @setupmethod
+    def teardown_appcontext(self, f: T_teardown) -> T_teardown:
+        """Registers a function to be called when the application
+        context is popped. The application context is typically popped
+        after the request context for each request, at the end of CLI
+        commands, or after a manually pushed context ends.
+
+        .. code-block:: python
+
+            with app.app_context():
+                ...
+
+        When the ``with`` block exits (or ``ctx.pop()`` is called), the
+        teardown functions are called just before the app context is
+        made inactive. Since a request context typically also manages an
+        application context it would also be called when you pop a
+        request context.
+
+        When a teardown function was called because of an unhandled
+        exception it will be passed an error object. If an
+        :meth:`errorhandler` is registered, it will handle the exception
+        and the teardown will not receive it.
+
+        Teardown functions must avoid raising exceptions. If they
+        execute code that might fail they must surround that code with a
+        ``try``/``except`` block and log any errors.
+
+        The return values of teardown functions are ignored.
+
+        .. versionadded:: 0.9
+        """
+        self.teardown_appcontext_funcs.append(f)
+        return f
+
+    @setupmethod
+    def shell_context_processor(
+        self, f: T_shell_context_processor
+    ) -> T_shell_context_processor:
+        """Registers a shell context processor function.
+
+        .. versionadded:: 0.11
+        """
+        self.shell_context_processors.append(f)
+        return f
+
+    def _find_error_handler(
+        self, e: Exception, blueprints: list[str]
+    ) -> ft.ErrorHandlerCallable | None:
+        """Return a registered error handler for an exception in this order:
+        blueprint handler for a specific code, app handler for a specific code,
+        blueprint handler for an exception class, app handler for an exception
+        class, or ``None`` if a suitable handler is not found.
+        """
+        exc_class, code = self._get_exc_class_and_code(type(e))
+        names = (*blueprints, None)
+
+        for c in (code, None) if code is not None else (None,):
+            for name in names:
+                handler_map = self.error_handler_spec[name][c]
+
+                if not handler_map:
+                    continue
+
+                for cls in exc_class.__mro__:
+                    handler = handler_map.get(cls)
+
+                    if handler is not None:
+                        return handler
+        return None
+
+    def trap_http_exception(self, e: Exception) -> bool:
+        """Checks if an HTTP exception should be trapped or not.  By default
+        this will return ``False`` for all exceptions except for a bad request
+        key error if ``TRAP_BAD_REQUEST_ERRORS`` is set to ``True``.  It
+        also returns ``True`` if ``TRAP_HTTP_EXCEPTIONS`` is set to ``True``.
+
+        This is called for all HTTP exceptions raised by a view function.
+        If it returns ``True`` for any exception the error handler for this
+        exception is not called and it shows up as regular exception in the
+        traceback.  This is helpful for debugging implicitly raised HTTP
+        exceptions.
+
+        .. versionchanged:: 1.0
+            Bad request errors are not trapped by default in debug mode.
+
+        .. versionadded:: 0.8
+        """
+        if self.config["TRAP_HTTP_EXCEPTIONS"]:
+            return True
+
+        trap_bad_request = self.config["TRAP_BAD_REQUEST_ERRORS"]
+
+        # if unset, trap key errors in debug mode
+        if (
+            trap_bad_request is None
+            and self.debug
+            and isinstance(e, BadRequestKeyError)
+        ):
+            return True
+
+        if trap_bad_request:
+            return isinstance(e, BadRequest)
+
+        return False
+
+    def should_ignore_error(self, error: BaseException | None) -> bool:
+        """This is called to figure out if an error should be ignored
+        or not as far as the teardown system is concerned.  If this
+        function returns ``True`` then the teardown handlers will not be
+        passed the error.
+
+        .. versionadded:: 0.10
+        """
+        return False
+
+    def redirect(self, location: str, code: int = 302) -> BaseResponse:
+        """Create a redirect response object.
+
+        This is called by :func:`flask.redirect`, and can be called
+        directly as well.
+
+        :param location: The URL to redirect to.
+        :param code: The status code for the redirect.
+
+        .. versionadded:: 2.2
+            Moved from ``flask.redirect``, which calls this method.
+        """
+        return _wz_redirect(
+            location, code=code, Response=self.response_class  # type: ignore[arg-type]
         )
-    ''')
 
-    # Insert the 2nd record
-    cursor.execute('''
-        INSERT INTO hotels (
-            id, imageLink, rating, hotelName, hotelDesc, location, country, price, stayDetails,
-            locationLink, locationInfo, allAmenities, commentAmount, availableFrom, availableTo, isCheapToMembers, availableRoomAmount
-        ) VALUES (
-            2, 'https://images.trvl-media.com/lodging/9000000/8300000/8291700/8291672/9cefea27_w.jpg?impolicy=fcrop&w=600&h=400&p=1&q=high',
-            9.4, 'Casa Nonna Bodrum - Adult Only', 'Bodrum bölgesinde, plaja sıfır, spa, ücretsiz plaj servisi olan otel.', 'Bodrum', 'Turkey',
-            7817,
-            '2 gecelik için', 
-            'https://www.google.com/maps/embed?pb=!1m18!1m12!1m3!1d3186.247034840965!2d27.459294811388233!3d37.00390255607451!2m3!1f0!2f0!3f0!3m2!1i1024!2i768!4f13.1!3m3!1m2!1s0x14be6b7be1e659c9%3A0x1bc22ebad3fa2859!2sCasa%20Nonna%20Bodrum!5e0!3m2!1str!2str!4v1704995890363!5m2!1str!2str',
-            'İçmeler Mevkii, P.K. 357, Bodrum, Muğla, 48400',
-            '["Restoran", "Bar", "Havuz", "Ücretsiz kablosuz internet", "Spor Salonu", "Klima"]',
-            48,
-            '2024-01-22',
-            '2024-01-27',
-            'false', 3
-        )
-    ''')
-
-    # Insert the 3rd record
-    cursor.execute('''
-        INSERT INTO hotels (
-            id, imageLink, rating, hotelName, hotelDesc, location, country, price, stayDetails,
-            locationLink, locationInfo, allAmenities, commentAmount, availableFrom, availableTo, isCheapToMembers, availableRoomAmount
-        ) VALUES (
-            3, 'https://images.trvl-media.com/lodging/68000000/67420000/67416300/67416227/e1f70e7d_w.jpg?impolicy=fcrop&w=600&h=400&p=1&q=high',
-            7.8, 'Sundia Exclusive by Liberty Fethiye', 'Fethiye bölgesinde, plaja sıfır, spa, restoran olan otel.', 'İstanbul', 'Turkey', 
-            4141,
-            '2 gecelik için', 
-            'https://www.google.com/maps/embed?pb=!1m18!1m12!1m3!1d25538.871677594318!2d30.83790233519331!3d36.85782586928015!2m3!1f0!2f0!3f0!3m2!1i1024!2i768!4f13.1!3m3!1m2!1s0x14c359420fff7e37%3A0x3bf6a3a890bbd8f2!2sLara%20Barut%20Collection!5e0!3m2!1str!2str!4v1704991199346!5m2!1str!2str',
-            'Çalis Beach, Foca Mah.1085. Sok., Fethiye, Mugla, 48300',
-            '["Restoran", "Bar", "Havuz", "Ücretsiz kablosuz internet", "Klima", "Spor Salonu"]',
-            10,
-            '2024-01-26',
-            '2024-01-31',
-            'true', 1
-        )
-    ''')
-
-    # Insert the 3rd record
-    cursor.execute('''
-        INSERT INTO hotels (
-            id, imageLink, rating, hotelName, hotelDesc, location, country, price, stayDetails,
-            locationLink, locationInfo, allAmenities, commentAmount, availableFrom, availableTo, isCheapToMembers, availableRoomAmount
-        ) VALUES (
-            4, 'https://images.trvl-media.com/lodging/1000000/30000/22300/22287/33fa163a.jpg?impolicy=resizecrop&rw=598&ra=fit',
-            7.2, 'The Dixie Hollywood', 'Hotel with outdoor pool, near Hollywood Boulevard', 'Los Angeles', 'USA',
-            6000,
-            'For 1 night', 
-            'https://www.google.com/maps/embed?pb=!1m18!1m12!1m3!1d3303.7463511926026!2d-118.3102823887271!3d34.10163781500849!2m3!1f0!2f0!3f0!3m2!1i1024!2i768!4f13.1!3m3!1m2!1s0x80c2bf50f3eaa277%3A0xcd2d8d1f7b02fa58!2sThe%20Dixie%20Hollywood%20Hotel!5e0!3m2!1str!2str!4v1705141705306!5m2!1str!2str',
-            '5410 Hollywood Blvd, Los Angeles, CA, 90027',
-            '["Havuz", "Havaalanı transferi", "Bar", "Ücretsiz kablosuz internet", "Çamaşırhane","Klima", "7/24 açık resepsiyon"]',
-            1023,
-            '2024-01-18',
-            '2024-01-23',
-            'true', 2
-        )
-    ''')
-
-    # Insert the 3rd record
-    cursor.execute('''
-        INSERT INTO hotels (
-            id, imageLink, rating, hotelName, hotelDesc, location, country, price, stayDetails,
-            locationLink, locationInfo, allAmenities, commentAmount, availableFrom, availableTo, isCheapToMembers, availableRoomAmount
-        ) VALUES (
-            5, 'https://images.trvl-media.com/lodging/1000000/20000/19800/19768/ea54de87.jpg?impolicy=resizecrop&rw=598&ra=fit',
-            8.0, 'New York Hilton Midtown', 'Upscale hotel with 2 restaurants, near 5th Avenue', 'New York', 'USA',
-            7231,
-            'For 1 nights', 
-            'https://www.google.com/maps/embed?pb=!1m18!1m12!1m3!1d3021.9896608589006!2d-73.98177028844894!3d40.76225213441839!2m3!1f0!2f0!3f0!3m2!1i1024!2i768!4f13.1!3m3!1m2!1s0x89c25855c0679529%3A0x2a34371cb33f3c80!2sNew%20York%20Hilton%20Midtown!5e0!3m2!1str!2str!4v1705142208837!5m2!1str!2str',
-            '1335 Avenue Of The Americas, New York, NY, 10019',
-            '["Spa", "Ücretsiz kablosuz internet", "Spor Salonu", "Klima", "Restoran", "Bar"]',
-            1467,
-            '2024-01-22',
-            '2024-01-27',
-            'true', 3
-        )
-    ''')
-
-    # Insert the 3rd record
-    cursor.execute('''
-        INSERT INTO hotels (
-            id, imageLink, rating, hotelName, hotelDesc, location, country, price, stayDetails,
-            locationLink, locationInfo, allAmenities, commentAmount, availableFrom, availableTo, isCheapToMembers, availableRoomAmount
-        ) VALUES (
-            6, 'https://images.trvl-media.com/lodging/69000000/68110000/68102900/68102878/e1245d5b.jpg?impolicy=resizecrop&rw=598&ra=fit',
-            9.4, 'Canopy by Hilton Chicago Central Loop', 'Upscale hotel with restaurant, near Willis Tower', 'Chicago', 'USA', 
-            14786,
-            'For 1 nights', 
-            'https://www.google.com/maps/embed?pb=!1m18!1m12!1m3!1d2970.680956358433!2d-87.63685138839777!3d41.87821026528745!2m3!1f0!2f0!3f0!3m2!1i1024!2i768!4f13.1!3m3!1m2!1s0x880e2de6ad83a821%3A0x3a5149b42db40fcb!2sCanopy%20by%20Hilton%20Chicago%20Central%20Loop!5e0!3m2!1str!2str!4v1705142562501!5m2!1str!2str',
-            '226 West Jackson Blvd, Chicago, IL, 60606',
-            '[  "Ücretsiz kablosuz internet", "Spor Salonu", "Restoran", "Bar", "Klima", "7/24 açık resepsiyon"]',
-            10,
-            '2024-01-26',
-            '2024-01-31',
-            'true', 1
-        )
-    ''')
-
-
-    # Commit the changes and close the connection
-    conn.commit()
-    conn.close()
-
-def create_users_table():
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-
-    # Create a table for users
-    cursor.execute('''
-        CREATE TABLE Users (
-            id INTEGER PRIMARY KEY,
-            Name TEXT NOT NULL,
-            Surname TEXT NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            country TEXT,
-            city TEXT
-        )
-    ''')
-
-    # Insert sample records with hashed passwords
-    cursor.execute('''
-        INSERT INTO Users (Name, Surname, email, password, country, city)
-        VALUES ('Ahmet', 'Yılmaz', 'ahmet@example.com', ?, 'Turkey', 'Istanbul')
-    ''', (generate_password_hash('hashed_password_tr1'),))
-
-    cursor.execute('''
-        INSERT INTO Users (Name, Surname, email, password, country, city)
-        VALUES ('John', 'Doe', 'john@example.com', ?, 'USA', 'New York')
-    ''', (generate_password_hash('hashed_password_usa2'),))
-
-    conn.commit()
-    conn.close()
-
-@app.route('/login', methods=['POST'])
-def login():
-    data = request.json
-    email = data.get('email')
-    password = data.get('password')
-
-    # Perform authentication logic here (e.g., check credentials against the database)
-
-    # For example, assuming you have a function check_credentials(email, password)
-    user_info = check_credentials(email, password)
-    if user_info:
-        name, surname, country = user_info
-        return jsonify({'message': 'Login successful', 'name': name, 'surname': surname, 'locale': country})
-    else:
-        return jsonify({'message': 'Login failed'}), 401
-
-def check_credentials(email, password):
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-
-    # Query to fetch user with the given email
-    cursor.execute('''
-        SELECT * FROM Users WHERE email = ?
-    ''', (email,))
-    user = cursor.fetchone()
-
-    conn.close()
-
-    if user:
-        # Check if the provided password matches the hashed password in the database
-        if check_password_hash(user[4], password):
-            # Return name and surname on successful login
-            return user[1], user[2], user[5]
-    # User not found or incorrect password
-    return None
-# Backend - Flask
-@app.route('/register', methods=['POST'])
-def register():
-    data = request.json
-    name = data.get('name')
-    surname = data.get('surname')
-    email = data.get('email')
-    password = data.get('password')
-    country = data.get('country')
-    city = data.get('city')
-
-    # Perform user registration logic here
-    # (e.g., insert a new user into the database)
-
-    # For example, assuming you have a function register_user
-    if register_user(name, surname, email, password, country, city):
-        return jsonify({'message': 'Registration successful'})
-    else:
-        return jsonify({'message': 'Registration failed'}), 400
-
-def register_user(name, surname, email, password, country, city):
-    # Implement user registration logic
-    # Insert the new user into the database
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-
-    try:
-        # Check if the email is already in use
-        cursor.execute('SELECT * FROM Users WHERE email = ?', (email,))
-        existing_user = cursor.fetchone()
-        if existing_user:
-            return False  # Registration failed, email already in use
-
-        # Insert the new user
-        cursor.execute('''
-            INSERT INTO Users (Name, Surname, email, password, country, city)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (name, surname, email, generate_password_hash(password), country, city))
-
-        # Commit the changes and close the connection
-        conn.commit()
-        return True  # Registration successful
-    except Exception as e:
-        print(f"Error during registration: {e}")
-        return False  # Registration failed
-
-    finally:
-        # Close the connection
-        conn.close()
-
-@app.route('/', methods=['GET'])
-def get_hotels():
-    conn = sqlite3.connect('hotels.db')
-    cursor = conn.cursor()
-
-    # Get the country from the query parameters
-    country = request.args.get('country', None)
-
-    if country:
-        # If country is provided, filter the results
-        cursor.execute('SELECT * FROM hotels WHERE country = ?', (country,))
-    else:
-        # If country is not provided, get all results
-        cursor.execute('SELECT * FROM hotels')
-
-    columns = [col[0] for col in cursor.description]
-    hotels = [dict(zip(columns, row)) for row in cursor.fetchall()]
-
-    conn.close()
-    return jsonify({'hotels': hotels})
-
-@app.route('/hotel-detail/<id>', methods=['GET'])
-def get_hotel_details(id):
-    conn = sqlite3.connect('hotels.db')
-    cursor = conn.cursor()
-
-    # Use a parameterized query to avoid SQL injection
-    cursor.execute('SELECT * FROM hotels WHERE id = ?', (id,))
-    
-    # Fetch all rows matching the query
-    rows = cursor.fetchall()
-
-    # Assuming 'id' is unique, get the first row
-    if rows:
-        columns = [col[0] for col in cursor.description]
-        hotel = dict(zip(columns, rows[0]))
-        conn.close()
-        return jsonify({'hotels': [hotel]})
-    else:
-        conn.close()
-        return jsonify({'hotels': []})
-
-
-
-
-'''
-@app.route('/search-results', methods=['GET'])
-def get_filtered_hotels():
-    search_text = request.args.get('search', '')
-    available_room_amount = request.args.get('availableRoomAmount', None)
-    entered_from = request.args.get('enteredFrom', '')
-    entered_to = request.args.get('enteredTo', '')
-
-    # Veritabanına bağlan
-    conn = sqlite3.connect('hotels.db')
-    cursor = conn.cursor()
-
-    print(search_text)
-    print(available_room_amount)
-    print("a - " + entered_from)
-    print("b - " + entered_to)
-
-    try:
-        entered_from = datetime.strptime(entered_from, '%Y.%m.%d').date()
-        entered_to = datetime.strptime(entered_to, '%Y.%m.%d').date()
-
-        print("ccc")
-        print(entered_from)
-        print(entered_to)   
-        print("ccc")
-    except ValueError:
-        # Handle the case where entered_from or entered_to is not a valid date
-        entered_from = ''
-        entered_to = ''
-    
-
-    print("ddd")
-
-    
-    if search_text != '':
-        if entered_from == '' or entered_to == '':
-            cursor.execute("SELECT * FROM hotels WHERE location LIKE ? AND availableRoomAmount >= ?", ('%' + search_text + '%',available_room_amount ))
-        elif entered_from != '' and entered_to != '':
-            cursor.execute("SELECT * FROM hotels WHERE ((availableFrom <= ? AND availableTo >= ?) AND (availableFrom <= ? AND availableTo >= ?)) AND location LIKE ? AND availableRoomAmount >= ?",
-                    (entered_from, entered_from, entered_to, entered_to, '%' + search_text + '%',available_room_amount))
-    elif search_text == '':
-        if entered_from == '' or entered_to == '':
-            cursor.execute("SELECT * FROM hotels WHERE availableRoomAmount >= ?", (available_room_amount,))
-        elif entered_from != '' and entered_to != '':
-            cursor.execute("SELECT * FROM hotels WHERE ((availableFrom <= ? AND availableTo >= ?) AND (availableFrom <= ? AND availableTo >= ?)) AND availableRoomAmount >= ?",
-                    (entered_from, entered_from, entered_to, entered_to, available_room_amount))
-
-
-
-    # Sorguya uyan tüm satırları al
-    rows = cursor.fetchall()
-
-    print("hhh")
-
-
-    # 'id' varsayılan olarak benzersiz olduğundan, ilk satırı al
-    if rows:
-        hotels = [dict(zip([col[0] for col in cursor.description], row)) for row in rows]
-    else:
-        hotels = []
-
-    conn.close()
-    return jsonify({'hotels': hotels})
-'''
-@app.route('/search-results', methods=['GET'])
-def get_filtered_hotels():
-    search_text = request.args.get('search', '')
-    available_room_amount = request.args.get('availableRoomAmount', None)
-    entered_from = request.args.get('enteredFrom', '')
-    entered_to = request.args.get('enteredTo', '')
-
-    # Get the decoded locale from the user session
-    decoded_locale = request.args.get('locale')
-
-    # Veritabanına bağlan
-    conn = sqlite3.connect('hotels.db')
-    cursor = conn.cursor()
-
-    try:
-        entered_from = datetime.strptime(entered_from, '%Y.%m.%d').date()
-        entered_to = datetime.strptime(entered_to, '%Y.%m.%d').date()
-    except ValueError:
-        # Handle the case where entered_from or entered_to is not a valid date
-        entered_from = None
-        entered_to = None
-
-    # Construct the base query
-    base_query = "SELECT * FROM hotels WHERE"
-
-    # Add conditions based on search_text
-    if search_text:
-        base_query += f" location LIKE '%{search_text}%' AND"
-
-    # Add conditions based on entered_from and entered_to
-    if entered_from and entered_to:
-        base_query += f" ((availableFrom <= '{entered_from}' AND availableTo >= '{entered_from}') AND (availableFrom <= '{entered_to}' AND availableTo >= '{entered_to}')) AND"
-
-    # Add conditions based on available_room_amount
-    if available_room_amount:
-        base_query += f" availableRoomAmount >= {available_room_amount} AND"
-
-    # Add conditions based on decoded_locale (if available)
-    if decoded_locale:
-        base_query += f" country = '{decoded_locale}' AND"
-
-    # Remove the trailing 'AND' if there are additional conditions
-    if base_query.endswith("AND"):
-        base_query = base_query[:-3]
-
-    # Execute the final query
-    cursor.execute(base_query)
-
-    # Sorguya uyan tüm satırları al
-    rows = cursor.fetchall()
-
-    # 'id' varsayılan olarak benzersiz olduğundan, ilk satırı al
-    if rows:
-        hotels = [dict(zip([col[0] for col in cursor.description], row)) for row in rows]
-    else:
-        hotels = []
-
-    conn.close()
-    return jsonify({'hotels': hotels})
- 
-
-
-if __name__ == '__main__':
-    print(app)
-    app.run(debug=True)
-    #createHotelsTable()
+    def inject_url_defaults(self, endpoint: str, values: dict) -> None:
+        """Injects the URL defaults for the given endpoint directly into
+        the values dictionary passed.  This is used internally and
+        automatically called on URL building.
+
+        .. versionadded:: 0.7
+        """
+        names: t.Iterable[str | None] = (None,)
+
+        # url_for may be called outside a request context, parse the
+        # passed endpoint instead of using request.blueprints.
+        if "." in endpoint:
+            names = chain(
+                names, reversed(_split_blueprint_path(endpoint.rpartition(".")[0]))
+            )
+
+        for name in names:
+            if name in self.url_default_functions:
+                for func in self.url_default_functions[name]:
+                    func(endpoint, values)
+
+    def handle_url_build_error(
+        self, error: BuildError, endpoint: str, values: dict[str, t.Any]
+    ) -> str:
+        """Called by :meth:`.url_for` if a
+        :exc:`~werkzeug.routing.BuildError` was raised. If this returns
+        a value, it will be returned by ``url_for``, otherwise the error
+        will be re-raised.
+
+        Each function in :attr:`url_build_error_handlers` is called with
+        ``error``, ``endpoint`` and ``values``. If a function returns
+        ``None`` or raises a ``BuildError``, it is skipped. Otherwise,
+        its return value is returned by ``url_for``.
+
+        :param error: The active ``BuildError`` being handled.
+        :param endpoint: The endpoint being built.
+        :param values: The keyword arguments passed to ``url_for``.
+        """
+        for handler in self.url_build_error_handlers:
+            try:
+                rv = handler(error, endpoint, values)
+            except BuildError as e:
+                # make error available outside except block
+                error = e
+            else:
+                if rv is not None:
+                    return rv
+
+        # Re-raise if called with an active exception, otherwise raise
+        # the passed in exception.
+        if error is sys.exc_info()[1]:
+            raise
+
+        raise error
